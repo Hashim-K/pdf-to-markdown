@@ -2,8 +2,10 @@
 .venv/
 __pycache__/
 *.py[cod]
-input/
-output/
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
 logs/
 outputs/
 upload/
