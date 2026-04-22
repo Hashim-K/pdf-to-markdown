@@ -6,17 +6,29 @@ import pytesseract
 import cv2
 import numpy as np
 from transformers import VisionEncoderDecoderModel, ViTImageProcessor, AutoTokenizer
+from transformers.utils import logging as transformers_logging
+from huggingface_hub.utils import logging as hf_hub_logging
 import torch
 from PIL import Image
 import os
 import logging
 import traceback
 import warnings
+import contextlib
+import io
 from pathlib import Path
 from abc import ABC, abstractmethod
 import argparse
 
 warnings.filterwarnings("ignore")
+transformers_logging.set_verbosity_error()
+hf_hub_logging.set_verbosity_error()
+
+for noisy_logger in ("httpx", "httpcore", "huggingface_hub"):
+    logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+
+for noisy_logger in ("transformers", "transformers.utils.loading_report"):
+    logging.getLogger(noisy_logger).setLevel(logging.ERROR)
 
 with open(Path("config/config.yaml").resolve(), "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
@@ -55,24 +67,56 @@ class MarkdownPDFExtractor(PDFExtractor):
     """Class for extracting markdown-formatted content from PDF."""
 
     BULLET_POINTS = "•◦▪▫●○"
+    CAPTION_MODEL_ID = "nlpconnect/vit-gpt2-image-captioning"
+    _captioning_assets = None
 
-    def __init__(self, pdf_path):
+    def __init__(self, pdf_path, output_dir=None):
         super().__init__(pdf_path)
         self.pdf_filename = Path(pdf_path).stem
-        Path(config["OUTPUT_DIR"]).mkdir(parents=True, exist_ok=True)
+        self.output_dir = Path(output_dir or config["OUTPUT_DIR"])
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.setup_image_captioning()
+
+    @classmethod
+    def load_captioning_assets(cls):
+        """Load captioning assets once, preferring the local HF cache."""
+        if cls._captioning_assets is not None:
+            return cls._captioning_assets
+
+        def load_assets(local_files_only):
+            model_kwargs = {
+                "use_safetensors": False,
+                "local_files_only": local_files_only,
+            }
+            asset_kwargs = {"local_files_only": local_files_only}
+
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                model = VisionEncoderDecoderModel.from_pretrained(
+                    cls.CAPTION_MODEL_ID, **model_kwargs
+                )
+                feature_extractor = ViTImageProcessor.from_pretrained(
+                    cls.CAPTION_MODEL_ID, **asset_kwargs
+                )
+                tokenizer = AutoTokenizer.from_pretrained(
+                    cls.CAPTION_MODEL_ID, **asset_kwargs
+                )
+            return model, feature_extractor, tokenizer
+
+        try:
+            model, feature_extractor, tokenizer = load_assets(local_files_only=True)
+        except Exception:
+            model, feature_extractor, tokenizer = load_assets(local_files_only=False)
+
+        cls._captioning_assets = (model, feature_extractor, tokenizer)
+        return cls._captioning_assets
 
     def setup_image_captioning(self):
         """Set up the image captioning model."""
         try:
-            self.model = VisionEncoderDecoderModel.from_pretrained(
-                "nlpconnect/vit-gpt2-image-captioning"
-            )
-            self.feature_extractor = ViTImageProcessor.from_pretrained(
-                "nlpconnect/vit-gpt2-image-captioning"
-            )
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                "nlpconnect/vit-gpt2-image-captioning"
+            self.model, self.feature_extractor, self.tokenizer = (
+                self.load_captioning_assets()
             )
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             self.model.to(self.device)
@@ -86,7 +130,7 @@ class MarkdownPDFExtractor(PDFExtractor):
             markdown_content, markdown_pages = self.extract_markdown()
             self.save_markdown(markdown_content)
             self.logger.info(
-                f"Markdown content has been saved to {Path(config['OUTPUT_DIR'])}/{self.pdf_filename}.md"
+                f"Markdown content has been saved to {self.output_dir}/{self.pdf_filename}.md"
             )
             return markdown_content, markdown_pages
 
@@ -274,6 +318,90 @@ class MarkdownPDFExtractor(PDFExtractor):
         text = re.sub(r"\s+", " ", text)
         return text
 
+    def is_math_span(self, span):
+        """Return True for spans that come from TeX/math fonts or math symbols."""
+        font = span.get("font", "")
+        text = span.get("text", "")
+        math_font_prefixes = ("CM", "MSAM", "MSBM", "STIX", "Math")
+        math_symbols = set("∈⊤⊥×÷±≤≥≠≈∑∏√∞∂∇∆∫·→←↔⇒⇔∧∨∩∪⊂⊃⊆⊇")
+        return font.startswith(math_font_prefixes) or any(
+            char in math_symbols for char in text
+        )
+
+    def get_line_math_baseline(self, line):
+        """Estimate the main math baseline for superscript/subscript detection."""
+        math_spans = [
+            span for span in line["spans"] if self.is_math_span(span) and span["text"].strip()
+        ]
+        if not math_spans:
+            return None, None
+
+        sizes = [span["size"] for span in math_spans]
+        base_size = max(sizes)
+        base_spans = [
+            span for span in math_spans if span["size"] >= base_size * 0.95
+        ] or math_spans
+        centers = sorted((span["bbox"][1] + span["bbox"][3]) / 2 for span in base_spans)
+        return centers[len(centers) // 2], base_size
+
+    def format_math_span(self, text, span, base_center, base_size):
+        """Format a math span without Markdown emphasis noise."""
+        text = self.clean_text(text)
+        if not text:
+            return ""
+
+        text = text.replace("−", "-")
+        if base_center is None or base_size is None:
+            return text
+
+        center_y = (span["bbox"][1] + span["bbox"][3]) / 2
+        is_small = span["size"] <= base_size * 0.85
+        is_simple_script = bool(re.fullmatch(r"\S{1,8}", text))
+
+        if is_small and is_simple_script:
+            if center_y < base_center - (base_size * 0.12):
+                return f"^{{{text}}}"
+            return f"_{{{text}}}"
+
+        if center_y < base_center - (base_size * 0.28) and len(text) <= 3:
+            return f"^{{{text}}}"
+        if center_y > base_center + (base_size * 0.28) and is_simple_script:
+            return f"_{{{text}}}"
+
+        return text
+
+    def normalize_math_markup(self, markdown_content):
+        """Clean up adjacent math fragments produced by PDF span splitting."""
+        markdown_content = re.sub(
+            r"\$([^$\n]+)\$\s+\$_\{([^}\n]+)\}\$",
+            r"$\1_{\2}$",
+            markdown_content,
+        )
+        markdown_content = re.sub(
+            r"\$([^$\n]+)\$\s+\$\^\{([^}\n]+)\}\$",
+            r"$\1^{\2}$",
+            markdown_content,
+        )
+
+        def normalize_match(match):
+            expression = match.group(1)
+            previous = None
+            while previous != expression:
+                previous = expression
+                expression = re.sub(
+                    r"\^\{([^{}]+)\}\^\{([^{}]+)\}",
+                    r"^{\1\2}",
+                    expression,
+                )
+                expression = re.sub(
+                    r"_\{([^{}]+)\}_\{([^{}]+)\}",
+                    r"_{\1\2}",
+                    expression,
+                )
+            return f"${expression}$"
+
+        return re.sub(r"\$([^$\n]+)\$", normalize_match, markdown_content)
+
     def apply_formatting(self, text, flags):
         """Apply markdown formatting to the given text based on flags."""
         text = text.strip()
@@ -285,12 +413,15 @@ class MarkdownPDFExtractor(PDFExtractor):
         is_monospace = flags & 2**3
         is_superscript = flags & 2**0
         is_subscript = flags & 2**5
+        is_script_candidate = not bool(re.search(r"\s+", text)) and (
+            len(text) <= 2 or bool(re.search(r"\d|[+\-=()[\]{}^]", text))
+        )
 
         if is_monospace:
             text = f"`{text}`"
-        elif is_superscript and not bool(re.search(r"\s+", text)):
+        elif is_superscript and is_script_candidate:
             text = f"^{text}^"
-        elif is_subscript and not bool(re.search(r"\s+", text)):
+        elif is_subscript and is_script_candidate:
             text = f"~{text}~"
 
         if is_bold and is_italic:
@@ -309,7 +440,7 @@ class MarkdownPDFExtractor(PDFExtractor):
     def convert_bullet_to_markdown(self, text):
         """Convert a bullet point to markdown format."""
         text = re.sub(r"^\s*", "", text)
-        return re.sub(f"^[{re.escape(self.BULLET_POINTS)}]\s*", "- ", text)
+        return re.sub(rf"^[{re.escape(self.BULLET_POINTS)}]\s*", "- ", text)
 
     def is_numbered_list_item(self, text):
         """Check if the given text is a numbered list item."""
@@ -432,14 +563,20 @@ class MarkdownPDFExtractor(PDFExtractor):
             for line in block["lines"]:
                 line_text = ""
                 curr_font_size = [span["size"] for span in line["spans"]]
+                math_base_center, math_base_size = self.get_line_math_baseline(line)
+                in_math_run = False
 
                 for span in line["spans"]:
                     text = span["text"]
                     font_size = span["size"]
                     flags = span["flags"]
                     span_rect = span["bbox"]
+                    is_math = self.is_math_span(span)
 
                     if self.is_horizontal_line(text):
+                        if in_math_run:
+                            line_text += "$ "
+                            in_math_run = False
                         line_text += "\n---\n"
                         continue
 
@@ -448,9 +585,23 @@ class MarkdownPDFExtractor(PDFExtractor):
                     if text.strip():
                         header_level = self.get_header_level(font_size)
                         if header_level > 0:
+                            if in_math_run:
+                                line_text += "$ "
+                                in_math_run = False
                             text = f"\n{'#' * header_level} {text}\n\n"
 
+                        elif is_math:
+                            if not in_math_run:
+                                line_text += " $"
+                                in_math_run = True
+                            text = self.format_math_span(
+                                text, span, math_base_center, math_base_size
+                            )
+
                         else:
+                            if in_math_run:
+                                line_text += "$ "
+                                in_math_run = False
                             is_list_item = self.is_bullet_point(
                                 text
                             ) or self.is_numbered_list_item(text)
@@ -472,6 +623,9 @@ class MarkdownPDFExtractor(PDFExtractor):
                             break
 
                     line_text += text
+
+                if in_math_run:
+                    line_text += "$"
 
                 if last_y1 is not None:
                     avg_last_font_size = (
@@ -560,9 +714,7 @@ class MarkdownPDFExtractor(PDFExtractor):
             image_filename = (
                 f"{self.pdf_filename}_image_{int(page.number)+1}_{block['number']}.png"
             )
-            image_path = (
-                Path(config["OUTPUT_DIR"]) / image_filename
-            )  # Convert to Path object
+            image_path = self.output_dir / image_filename
             image.save(image_path, "PNG", optimize=True, quality=95)
 
             caption = self.caption_image(image)
@@ -601,8 +753,8 @@ class MarkdownPDFExtractor(PDFExtractor):
                 r"\n{3,}", "\n\n", markdown_content
             )  # Remove excessive newlines
             markdown_content = re.sub(
-                r"(\d+)\s*\n", "", markdown_content
-            )  # Remove page numbers
+                r"(?m)^\s*\d+\s*$\n?", "", markdown_content
+            )  # Remove standalone page numbers
             markdown_content = re.sub(
                 r" +", " ", markdown_content
             )  # Remove multiple spaces
@@ -626,6 +778,7 @@ class MarkdownPDFExtractor(PDFExtractor):
                 markdown_content,
                 flags=re.MULTILINE,
             )  # Remove headers in the middle of lines
+            markdown_content = self.normalize_math_markup(markdown_content)
             return markdown_content
         except Exception as e:
             self.logger.error(f"Error post-processing markdown: {e}")
@@ -635,9 +788,9 @@ class MarkdownPDFExtractor(PDFExtractor):
     def save_markdown(self, markdown_content):
         """Save the markdown content to a file."""
         try:
-            os.makedirs(Path(config["OUTPUT_DIR"]), exist_ok=True)
+            os.makedirs(self.output_dir, exist_ok=True)
             with open(
-                f"{Path(config['OUTPUT_DIR'])}/{self.pdf_filename}.md",
+                self.output_dir / f"{self.pdf_filename}.md",
                 "w",
                 encoding="utf-8",
             ) as f:
